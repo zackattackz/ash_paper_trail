@@ -13,7 +13,7 @@ defmodule AshPaperTrail.Resource.Changes.CreateNewVersion do
   def change(changeset, _, _) do
     cond do
       AshPaperTrail.Resource.Info.temporal_inline?(changeset.resource) ->
-        stamp_inline_version(changeset, :force_change)
+        stamp_before_write(changeset)
 
       valid_for_tracking?(changeset) ->
         create_new_version(changeset)
@@ -55,7 +55,7 @@ defmodule AshPaperTrail.Resource.Changes.CreateNewVersion do
     case changesets do
       [%{resource: resource} | _] ->
         if AshPaperTrail.Resource.Info.temporal_inline?(resource) do
-          Enum.map(changesets, &stamp_inline_version(&1, :force_change))
+          Enum.map(changesets, &stamp_before_write/1)
         else
           changesets
         end
@@ -83,6 +83,12 @@ defmodule AshPaperTrail.Resource.Changes.CreateNewVersion do
 
     Enum.map(changesets_and_results, fn {_, result} -> {:ok, result} end)
   end
+
+  # Stamp just before the write, once the other changes' hooks have run: the stamp then
+  # describes what is written, including attributes those hooks set and a record that a
+  # lock such as `get_and_lock_for_update` re-read, not the record the caller passed in.
+  defp stamp_before_write(changeset),
+    do: Ash.Changeset.before_action(changeset, &stamp_inline_version(&1, :force_change))
 
   defp stamp_inline_version(
          %Ash.Changeset{action_type: :destroy, action: %{soft?: false}} = changeset,

@@ -8,6 +8,7 @@ defmodule AshPaperTrail.TemporalInlineTest do
   alias AshPaperTrail.Test.Accounts
 
   alias AshPaperTrail.Test.Posts.{
+    TemporalFullDiffPost,
     TemporalPost,
     TemporalPreviousValuesPost,
     TemporalSnapshotPost,
@@ -26,6 +27,7 @@ defmodule AshPaperTrail.TemporalInlineTest do
       Ash.DataLayer.Ets.stop(TemporalPost)
       Ash.DataLayer.Ets.stop(TemporalSnapshotPost)
       Ash.DataLayer.Ets.stop(TemporalPreviousValuesPost)
+      Ash.DataLayer.Ets.stop(TemporalFullDiffPost)
       Ash.DataLayer.Ets.stop(TemporalUpsertPost)
       Ash.DataLayer.Ets.stop(Accounts.User)
     end)
@@ -431,6 +433,123 @@ defmodule AshPaperTrail.TemporalInlineTest do
         )
 
       assert current.changes == %{subject: "subject"}
+    end
+
+    test "are those of the record re-read before the write, not of the stale record given" do
+      post = TemporalPreviousValuesPost.create!(%{subject: "subject", body: "A"}, as_of: @t1)
+      TemporalPreviousValuesPost.update!(post, %{body: "B"}, as_of: @t2)
+
+      # `post` still has body "A". The action re-reads it, with body "B".
+      TemporalPreviousValuesPost.update_refetched!(post, %{body: "C"}, as_of: @t3)
+
+      assert %{body: "C", changes: %{body: "B"}} =
+               version_at(TemporalPreviousValuesPost, post.id, @t3)
+    end
+  end
+
+  describe "full_diff tracking" do
+    test "diffs from the record re-read before the write, not from the stale record given" do
+      post = TemporalFullDiffPost.create!(%{subject: "subject", body: "A"}, as_of: @t1)
+      TemporalFullDiffPost.update!(post, %{body: "B"}, as_of: @t2)
+
+      # `post` still has body "A". The action re-reads it, with body "B".
+      TemporalFullDiffPost.update_refetched!(post, %{body: "C"}, as_of: @t3)
+
+      assert %{body: "C", changes: %{body: %{from: "B", to: "C"}}} =
+               version_at(TemporalFullDiffPost, post.id, @t3)
+    end
+  end
+
+  describe "stamping after the action's before_action hooks" do
+    test "an attribute set in a hook is stamped as this write's change" do
+      post = TemporalPost.create!(%{subject: "subject"}, as_of: @t1)
+      TemporalPost.increment_views_in_hook!(post, as_of: @t2)
+
+      assert %{
+               views: 1,
+               version_action_type: :update,
+               version_action_name: :increment_views_in_hook,
+               changes: %{views: 1}
+             } = version_at(TemporalPost, post.id, @t2)
+    end
+
+    test "an attribute set in a hook is stamped in a bulk update" do
+      post = TemporalPost.create!(%{subject: "subject"}, as_of: @t1)
+
+      assert %Ash.BulkResult{status: :success} =
+               Ash.bulk_update([post], :increment_views_in_hook, %{},
+                 strategy: :stream,
+                 as_of: @t2,
+                 return_errors?: true
+               )
+
+      assert %{
+               views: 1,
+               version_action_type: :update,
+               version_action_name: :increment_views_in_hook,
+               changes: %{views: 1}
+             } = version_at(TemporalPost, post.id, @t2)
+    end
+
+    test "previous values in a bulk update are those of the record re-read before the write" do
+      post = TemporalPreviousValuesPost.create!(%{subject: "subject", body: "A"}, as_of: @t1)
+      TemporalPreviousValuesPost.update!(post, %{body: "B"}, as_of: @t2)
+
+      # `post` still has body "A". The action re-reads it, with body "B".
+      assert %Ash.BulkResult{status: :success} =
+               Ash.bulk_update([post], :update_refetched, %{body: "C"},
+                 strategy: :stream,
+                 as_of: @t3,
+                 return_errors?: true
+               )
+
+      assert %{body: "C", changes: %{body: "B"}} =
+               version_at(TemporalPreviousValuesPost, post.id, @t3)
+    end
+
+    test "an ignored action whose only change is set in a hook clears the stamp" do
+      post = TemporalPost.create!(%{subject: "subject"}, as_of: @t1)
+      TemporalPost.ignored_increment!(post, as_of: @t2)
+
+      assert %{views: 1, version_action_type: nil, version_action_name: nil, changes: nil} =
+               version_at(TemporalPost, post.id, @t2)
+    end
+  end
+
+  describe "context set on a built changeset" do
+    test "paper_trail_metadata set after for_update is stored" do
+      post = TemporalPost.create!(%{subject: "subject"}, as_of: @t1)
+
+      post
+      |> Ash.Changeset.for_update(:non_atomic_update, %{body: "new body"}, as_of: @t2)
+      |> Ash.Changeset.set_context(%{paper_trail_metadata: %{reason_for_change: "late"}})
+      |> Ash.update!()
+
+      assert %{body: "new body", reason_for_change: "late"} =
+               version_at(TemporalPost, post.id, @t2)
+    end
+
+    test "paper_trail_metadata passed to Ash.update/2 with a built changeset is stored" do
+      post = TemporalPost.create!(%{subject: "subject"}, as_of: @t1)
+
+      post
+      |> Ash.Changeset.for_update(:non_atomic_update, %{body: "new body"}, as_of: @t2)
+      |> Ash.update!(context: %{paper_trail_metadata: %{reason_for_change: "late"}})
+
+      assert %{body: "new body", reason_for_change: "late"} =
+               version_at(TemporalPost, post.id, @t2)
+    end
+
+    test "ash_paper_trail_disabled? set after for_update clears the stamp" do
+      post = TemporalPost.create!(%{subject: "subject"}, as_of: @t1)
+
+      post
+      |> Ash.Changeset.for_update(:non_atomic_update, %{body: "new body"}, as_of: @t2)
+      |> Ash.Changeset.set_context(%{ash_paper_trail_disabled?: true})
+      |> Ash.update!()
+
+      assert %{body: "new body", version_action_type: nil, reason_for_change: nil} =
+               version_at(TemporalPost, post.id, @t2)
     end
   end
 

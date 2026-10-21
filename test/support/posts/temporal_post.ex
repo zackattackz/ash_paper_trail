@@ -28,7 +28,7 @@ defmodule AshPaperTrail.Test.Posts.TemporalPost do
     change_tracking_mode :changes_only
     store_action_name? true
     ignore_attributes [:inserted_at, :updated_at]
-    ignore_actions [:ignored_update]
+    ignore_actions [:ignored_update, :ignored_increment]
 
     belongs_to_actor :user, AshPaperTrail.Test.Accounts.User,
       domain: AshPaperTrail.Test.Accounts.Domain
@@ -44,6 +44,9 @@ defmodule AshPaperTrail.Test.Posts.TemporalPost do
     define :silent_update
     define :ignored_update
     define :increment_views
+    define :increment_views_in_hook
+    define :ignored_increment
+    define :non_atomic_update
     define :archive
   end
 
@@ -61,6 +64,24 @@ defmodule AshPaperTrail.Test.Posts.TemporalPost do
     update :increment_views do
       accept []
       change atomic_update(:views, expr(views + 1))
+    end
+
+    # Not atomic, so `increment` sets `views` in a `before_action` hook.
+    update :increment_views_in_hook do
+      require_atomic? false
+      accept []
+      change increment(:views)
+    end
+
+    # The same, on an ignored action.
+    update :ignored_increment do
+      require_atomic? false
+      accept []
+      change increment(:views)
+    end
+
+    update :non_atomic_update do
+      require_atomic? false
     end
 
     # Written as an update, like AshArchival's archive.
