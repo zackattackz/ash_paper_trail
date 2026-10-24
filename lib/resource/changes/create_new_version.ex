@@ -13,7 +13,7 @@ defmodule AshPaperTrail.Resource.Changes.CreateNewVersion do
   def change(changeset, _, _) do
     cond do
       AshPaperTrail.Resource.Info.temporal_inline?(changeset.resource) ->
-        stamp_inline_version(changeset, :force_change)
+        write_when_always_versioned(changeset)
 
       valid_for_tracking?(changeset) ->
         create_new_version(changeset)
@@ -34,10 +34,8 @@ defmodule AshPaperTrail.Resource.Changes.CreateNewVersion do
            "You might want to choose a different tracking mode or set require_atomic? to false on your update actions."}
 
       AshPaperTrail.Resource.Info.temporal_inline?(changeset.resource) ->
-        # A fully atomic changeset cannot carry `before_action` hooks. Our change runs
-        # last, so every other change's atomics are already on the changeset and we can
-        # stamp it directly.
-        {:ok, stamp_inline_version(changeset, :atomic)}
+        # The stamp is computed in `before_write/3`, on this path too.
+        {:ok, write_when_always_versioned(changeset)}
 
       change_tracking_mode == :previous_values ->
         {:not_atomic,
@@ -55,7 +53,7 @@ defmodule AshPaperTrail.Resource.Changes.CreateNewVersion do
     case changesets do
       [%{resource: resource} | _] ->
         if AshPaperTrail.Resource.Info.temporal_inline?(resource) do
-          Enum.map(changesets, &stamp_inline_version(&1, :force_change))
+          Enum.map(changesets, &write_when_always_versioned/1)
         else
           changesets
         end
@@ -84,39 +82,50 @@ defmodule AshPaperTrail.Resource.Changes.CreateNewVersion do
     Enum.map(changesets_and_results, fn {_, result} -> {:ok, result} end)
   end
 
-  defp stamp_inline_version(
-         %Ash.Changeset{action_type: :destroy, action: %{soft?: false}} = changeset,
-         _strategy
-       ),
-       do: changeset
+  # The stamp is computed by Ash as it writes the record: after every hook, once managed
+  # `belongs_to` attributes are set, and only if it writes. The same callback serves the
+  # atomic path, with the atomic changeset.
+  @impl true
+  def before_write(changeset, _opts, _context) do
+    if AshPaperTrail.Resource.Info.temporal_inline?(changeset.resource) do
+      inline_stamp(changeset)
+    else
+      :ok
+    end
+  end
 
-  defp stamp_inline_version(changeset, strategy) do
-    resource = changeset.resource
-    stamp_attributes = AshPaperTrail.Resource.Info.temporal_inline_attributes(resource)
-    update? = changeset.action_type in [:update, :destroy]
+  defp inline_stamp(%Ash.Changeset{action_type: :destroy, action: %{soft?: false}}), do: :ok
 
-    other_changes? =
-      changeset.attributes |> Map.drop(stamp_attributes) |> Enum.any?() ||
-        changeset.atomics |> Keyword.drop(stamp_attributes) |> Enum.any?()
+  defp inline_stamp(changeset) do
+    stamp_attributes = AshPaperTrail.Resource.Info.temporal_inline_attributes(changeset.resource)
+    strategy = if changeset.phase == :atomic, do: :atomic, else: :force_change
 
-    cond do
-      update? && !other_changes? && skip_when_unchanged?(changeset) ->
-        changeset
-
-      !valid_for_tracking?(changeset) ->
-        # The new row copies the previous version's stamp, which would describe a write
-        # other than this one. Clear it rather than leave it misleading.
-        if update? && other_changes? do
-          clear_inline_version(changeset, stamp_attributes, strategy)
-        else
-          changeset
-        end
-
-      true ->
+    stamped =
+      if valid_for_tracking?(changeset) do
         changeset
         |> put_inline_version(strategy)
         |> put_inline_changes(stamp_attributes, strategy)
-        |> include_in_upsert_fields(stamp_attributes)
+      else
+        # The new row would otherwise carry a copy of the previous version's stamp.
+        clear_inline_version(changeset, stamp_attributes, strategy)
+      end
+
+    values =
+      stamped.atomics
+      |> Keyword.take(stamp_attributes)
+      |> Map.new(fn {name, expression} -> {name, {:atomic, expression}} end)
+      |> Map.merge(Map.take(stamped.attributes, stamp_attributes))
+
+    {:ok, values}
+  end
+
+  # With `only_when_changed? false`, a no-op update still writes a version.
+  defp write_when_always_versioned(changeset) do
+    if changeset.action_type in [:update, :destroy] and valid_for_tracking?(changeset) and
+         not skip_when_unchanged?(changeset) do
+      Ash.Changeset.set_context(changeset, %{changed?: true})
+    else
+      changeset
     end
   end
 
@@ -221,7 +230,9 @@ defmodule AshPaperTrail.Resource.Changes.CreateNewVersion do
       to_skip =
         Ash.Resource.Info.primary_key(resource) ++
           AshPaperTrail.Resource.Info.ignore_attributes(resource) ++
-          stamp_attributes ++ List.wrap(Ash.Resource.Info.temporal_attribute(resource))
+          stamp_attributes ++
+          List.wrap(Ash.Resource.Info.temporal_attribute(resource)) ++
+          lazy_default_attributes(changeset)
 
       tracked = resource_attributes |> Map.drop(to_skip) |> Map.values()
 
@@ -273,16 +284,18 @@ defmodule AshPaperTrail.Resource.Changes.CreateNewVersion do
     end
   end
 
-  defp include_in_upsert_fields(changeset, stamp_attributes) do
-    case changeset.context[:private] do
-      %{upsert?: true, upsert_fields: upsert_fields} when is_list(upsert_fields) ->
-        Ash.Changeset.set_context(changeset, %{
-          private: %{upsert_fields: Enum.uniq(upsert_fields ++ stamp_attributes)}
-        })
+  # Ash applies lazy defaults (timestamps, for one) right before the write, after the stamp
+  # is computed in `:version_resource` mode. Skip them, so `changes` is the same in both.
+  defp lazy_default_attributes(%Ash.Changeset{action_type: :create} = changeset),
+    do: lazy_default_attributes(changeset.resource, :create)
 
-      _ ->
-        changeset
-    end
+  defp lazy_default_attributes(%Ash.Changeset{} = changeset),
+    do: lazy_default_attributes(changeset.resource, :update)
+
+  defp lazy_default_attributes(resource, type) do
+    (Ash.Resource.Info.lazy_matching_default_attributes(resource, type) ++
+       Ash.Resource.Info.lazy_non_matching_default_attributes(resource, type))
+    |> Enum.map(& &1.name)
   end
 
   defp sensitive_mode(changeset) do

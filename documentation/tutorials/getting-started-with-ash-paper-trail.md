@@ -413,7 +413,7 @@ Ash.load!(subscription, :paper_trail_versions)
 
 ### Ordering
 
-The stamp is computed when the changeset is built, after the action's own changes have run, so it reflects changes made by them. Attribute changes made later, in `before_action` hooks, are written to the row but not reflected in `changes`.
+A write is stamped by Ash as it is written (`c:Ash.Resource.Change.before_write/3`): after every hook, after Ash has set the attributes of managed `belongs_to` relationships, and only if the record is written. The stamp describes the write as made: attributes set by hooks or by managed relationships are in `changes`, a write whose only change is one of those is stamped as that write, `:previous_values` and `:full_diff` take the previous values from the record being replaced (the one a hook such as `get_and_lock_for_update()` re-read), and context set on the changeset after it was built is used. Atomic writes are stamped the same way, from the atomic changeset. Attributes set by lazy defaults, such as `update_timestamp`s, are left out of `changes`, as in `:version_resource` mode.
 
 ## Tracking Changes Conditionally
 
