@@ -413,7 +413,7 @@ Ash.load!(subscription, :paper_trail_versions)
 
 ### Ordering
 
-A non-atomic write is stamped in a `before_action` hook that runs after the action's own changes and their hooks, so the stamp reflects what they did: attributes they set, and a record a hook re-read (as `get_and_lock_for_update()` does) is used for `:previous_values` and `:full_diff`. Two things still run after that hook and are not reflected in the stamp: the attribute of a managed `belongs_to` relationship, which Ash sets right before the write, and `before_action` hooks added to the changeset after it was built. Such a change is written to the row but is not in `changes`, and when it is the write's only change, the write is not stamped.
+A non-atomic write is stamped in a `before_action` hook that runs after the action's own changes and their hooks. The stamp sees what they did: attributes they set, a record a hook re-read (as `get_and_lock_for_update()` does), and context set on the changeset after it was built. Two things still run after that hook and are missed: the attribute of a managed `belongs_to` relationship, which Ash sets right before the write, and `before_action` hooks added to the changeset after it was built. Such a change is written but is not in `changes`, and when it is the write's only change, the new row keeps the previous version's stamp.
 
 ## Tracking Changes Conditionally
 
